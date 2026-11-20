@@ -411,11 +411,12 @@ def run_baseline(
     established = 0
     anomaly_count = 0
 
-    print("\n===== NETWATCH BEHAVIOURAL BASELINES =====")
+    print("===== NETWATCH BEHAVIOURAL BASELINES =====")
     print(f"Interface          : {interface}")
     print(f"Evaluation window  : {latest_window}")
     print(f"Minimum samples    : {minimum_samples}")
-    print(f"History limit      : {history_limit}")\n    print(f"Bucket duration    : {bucket_seconds}s")
+    print(f"History limit      : {history_limit}")
+    print(f"Bucket duration    : {bucket_seconds}s")
 
     with db:
         for current_row in target_rows:
@@ -433,7 +434,7 @@ def run_baseline(
                 if row["window_start"] < latest_window
             ][-history_limit:]
 
-            print(f"\nDEVICE: {device_ip}")
+            print(f"DEVICE: {device_ip}")
 
             for metric_name, observed in current_values.items():
                 samples = [
@@ -538,7 +539,7 @@ def run_baseline(
 
     db.close()
 
-    print("\n===== BASELINE SUMMARY =====")
+    print("===== BASELINE SUMMARY =====")
     print(f"Devices evaluated       : {evaluated}")
     print(f"Established metric models: {established}")
     print(f"Anomaly observations    : {anomaly_count}")
@@ -560,7 +561,7 @@ def show_baselines(device_ip=None):
 
         rows = db.execute(query, params).fetchall()
 
-    print("\n===== STORED DEVICE BASELINES =====")
+    print("===== STORED DEVICE BASELINES =====")
 
     if not rows:
         print("No established baselines yet.")
@@ -585,14 +586,14 @@ def show_anomalies(limit=30):
             LIMIT ?
         """, (limit,)).fetchall()
 
-    print("\n===== NETWATCH ANOMALY EVENTS =====")
+    print("===== NETWATCH ANOMALY EVENTS =====")
 
     if not rows:
         print("No anomaly events recorded.")
         return
 
     for row in rows:
-        print("\n----------------------------------------")
+        print("----------------------------------------")
         print(f"Device   : {row['device_ip']}")
         print(f"Metric   : {row['metric_name']}")
         print(f"Severity : {row['severity']}")
@@ -619,7 +620,8 @@ def main():
 
     run_parser.add_argument("--interface", default="wlan0")
     run_parser.add_argument("--min-samples", type=int, default=10)
-    run_parser.add_argument("--history", type=int, default=30)\n    run_parser.add_argument("--bucket-seconds", type=int, default=60)
+    run_parser.add_argument("--history", type=int, default=30)
+    run_parser.add_argument("--bucket-seconds", type=int, default=60)
     run_parser.add_argument(
         "--medium-threshold",
         type=float,
@@ -653,7 +655,10 @@ def main():
                 "--min-samples, and --min-samples must be at least 2."
             )
 
-        if args.bucket_seconds < 1:\n            parser.error("--bucket-seconds must be positive.")\n\n        if args.medium_threshold <= 0:
+        if args.bucket_seconds < 1:
+            parser.error("--bucket-seconds must be positive.")
+
+        if args.medium_threshold <= 0:
             parser.error("--medium-threshold must be positive.")
 
         if args.high_threshold <= args.medium_threshold:
