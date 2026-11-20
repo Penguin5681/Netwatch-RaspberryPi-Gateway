@@ -1,0 +1,354 @@
+import argparse
+import hashlib
+import ipaddress
+import json
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+from agent.database import connect, initialize
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def format_time(value):
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def get_bucket(timestamp, window_seconds):
+    epoch = int(timestamp.timestamp())
+    bucket_epoch = epoch - (epoch % window_seconds)
+
+    return datetime.fromtimestamp(
+        bucket_epoch, timezone.utc
+    )
+
+
+def endpoint(ip, port):
+    return (ip, int(port) if port is not None else -1)
+
+
+def make_flow_key(bucket, interface, protocol, a, b):
+    raw = json.dumps(
+        [
+            bucket,
+            interface,
+            protocol,
+            a,
+            b,
+        ],
+        separators=(",", ":"),
+    )
+
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def ensure_schema(db):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS flow_summaries (
+            flow_key TEXT PRIMARY KEY,
+            window_start TEXT NOT NULL,
+            interface TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            endpoint_a_ip TEXT NOT NULL,
+            endpoint_a_port INTEGER,
+            endpoint_b_ip TEXT NOT NULL,
+            endpoint_b_port INTEGER,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            packets INTEGER NOT NULL,
+            bytes INTEGER NOT NULL,
+            a_to_b_packets INTEGER NOT NULL,
+            b_to_a_packets INTEGER NOT NULL,
+            a_to_b_bytes INTEGER NOT NULL,
+            b_to_a_bytes INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_flows_window
+        ON flow_summaries(window_start);
+
+        CREATE TABLE IF NOT EXISTS device_traffic (
+            window_start TEXT NOT NULL,
+            interface TEXT NOT NULL,
+            device_ip TEXT NOT NULL,
+            tx_packets INTEGER NOT NULL DEFAULT 0,
+            rx_packets INTEGER NOT NULL DEFAULT 0,
+            tx_bytes INTEGER NOT NULL DEFAULT 0,
+            rx_bytes INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(window_start, interface, device_ip)
+        );
+    """)
+
+
+def aggregate(window_minutes=15, bucket_seconds=60):
+    initialize()
+
+    db = connect()
+    ensure_schema(db)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        minutes=window_minutes
+    )
+
+    cutoff_string = format_time(cutoff)
+
+    cursor = db.execute("""
+        SELECT
+            timestamp,
+            interface,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            packet_length
+        FROM packet_observations
+        WHERE timestamp >= ?
+          AND src_ip IS NOT NULL
+          AND dst_ip IS NOT NULL
+        ORDER BY timestamp
+    """, (cutoff_string,))
+
+    flows = {}
+    devices = defaultdict(lambda: {
+        "tx_packets": 0,
+        "rx_packets": 0,
+        "tx_bytes": 0,
+        "rx_bytes": 0,
+    })
+
+    processed = 0
+
+    for row in cursor:
+        timestamp = parse_time(row["timestamp"])
+        interface = row["interface"]
+        protocol = row["protocol"]
+
+        src_ip = row["src_ip"]
+        dst_ip = row["dst_ip"]
+
+        src_port = row["src_port"]
+        dst_port = row["dst_port"]
+
+        packet_size = row["packet_length"]
+
+        bucket = get_bucket(timestamp, bucket_seconds)
+        bucket_string = format_time(bucket)
+
+        src = endpoint(src_ip, src_port)
+        dst = endpoint(dst_ip, dst_port)
+
+        if src <= dst:
+            a, b = src, dst
+            direction = "a_to_b"
+        else:
+            a, b = dst, src
+            direction = "b_to_a"
+
+        key = make_flow_key(
+            bucket_string,
+            interface,
+            protocol,
+            a,
+            b,
+        )
+
+        if key not in flows:
+            flows[key] = {
+                "flow_key": key,
+                "window_start": bucket_string,
+                "interface": interface,
+                "protocol": protocol,
+                "endpoint_a_ip": a[0],
+                "endpoint_a_port": None if a[1] == -1 else a[1],
+                "endpoint_b_ip": b[0],
+                "endpoint_b_port": None if b[1] == -1 else b[1],
+                "first_seen": timestamp,
+                "last_seen": timestamp,
+                "packets": 0,
+                "bytes": 0,
+                "a_to_b_packets": 0,
+                "b_to_a_packets": 0,
+                "a_to_b_bytes": 0,
+                "b_to_a_bytes": 0,
+            }
+
+        flow = flows[key]
+
+        flow["first_seen"] = min(
+            flow["first_seen"], timestamp
+        )
+        flow["last_seen"] = max(
+            flow["last_seen"], timestamp
+        )
+
+        flow["packets"] += 1
+        flow["bytes"] += packet_size
+        flow[f"{direction}_packets"] += 1
+        flow[f"{direction}_bytes"] += packet_size
+
+        devices[(bucket_string, interface, src_ip)]["tx_packets"] += 1
+        devices[(bucket_string, interface, src_ip)]["tx_bytes"] += packet_size
+
+        devices[(bucket_string, interface, dst_ip)]["rx_packets"] += 1
+        devices[(bucket_string, interface, dst_ip)]["rx_bytes"] += packet_size
+
+        processed += 1
+
+    flow_rows = []
+
+    for flow in flows.values():
+        flow_rows.append((
+            flow["flow_key"],
+            flow["window_start"],
+            flow["interface"],
+            flow["protocol"],
+            flow["endpoint_a_ip"],
+            flow["endpoint_a_port"],
+            flow["endpoint_b_ip"],
+            flow["endpoint_b_port"],
+            format_time(flow["first_seen"]),
+            format_time(flow["last_seen"]),
+            flow["packets"],
+            flow["bytes"],
+            flow["a_to_b_packets"],
+            flow["b_to_a_packets"],
+            flow["a_to_b_bytes"],
+            flow["b_to_a_bytes"],
+        ))
+
+    device_rows = [
+        (
+            window_start,
+            interface,
+            ip,
+            values["tx_packets"],
+            values["rx_packets"],
+            values["tx_bytes"],
+            values["rx_bytes"],
+        )
+        for (window_start, interface, ip), values
+        in devices.items()
+    ]
+
+    with db:
+        db.execute("DELETE FROM flow_summaries")
+        db.execute("DELETE FROM device_traffic")
+
+        db.executemany("""
+            INSERT INTO flow_summaries VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
+        """, flow_rows)
+
+        db.executemany("""
+            INSERT INTO device_traffic VALUES (
+                ?, ?, ?, ?, ?, ?, ?
+            )
+        """, device_rows)
+
+    db.close()
+
+    print("\n===== NETWATCH FLOW ANALYSIS =====")
+    print(f"Packets processed : {processed}")
+    print(f"Unique flows      : {len(flows)}")
+    print(f"Observed endpoints: {len({
+        key[2] for key in devices
+    })}")
+    print(f"Analysis window   : {window_minutes} minutes")
+    print(f"Flow bucket       : {bucket_seconds} seconds")
+
+
+def print_top_flows(limit=10):
+    with connect() as db:
+        rows = db.execute("""
+            SELECT
+                protocol,
+                endpoint_a_ip,
+                endpoint_a_port,
+                endpoint_b_ip,
+                endpoint_b_port,
+                packets,
+                bytes,
+                first_seen,
+                last_seen
+            FROM flow_summaries
+            ORDER BY bytes DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    print("\n===== TOP NETWORK FLOWS =====")
+
+    for row in rows:
+        print(
+            f"{row['protocol']:<8} "
+            f"{row['endpoint_a_ip']}:{row['endpoint_a_port']} "
+            f"<-> "
+            f"{row['endpoint_b_ip']}:{row['endpoint_b_port']} "
+            f"| {row['packets']} packets "
+            f"| {row['bytes']} bytes"
+        )
+
+
+def print_device_traffic(limit=10):
+    with connect() as db:
+        rows = db.execute("""
+            SELECT
+                device_ip,
+                SUM(tx_packets) AS tx_packets,
+                SUM(rx_packets) AS rx_packets,
+                SUM(tx_bytes) AS tx_bytes,
+                SUM(rx_bytes) AS rx_bytes
+            FROM device_traffic
+            GROUP BY device_ip
+            ORDER BY SUM(tx_bytes + rx_bytes) DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    print("\n===== OBSERVED IP TRAFFIC =====")
+
+    for row in rows:
+        print(
+            f"{row['device_ip']:<40} "
+            f"TX: {row['tx_bytes']:>10} bytes "
+            f"RX: {row['rx_bytes']:>10} bytes"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NetWatch flow aggregation engine"
+    )
+
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=15,
+        help="Analysis period in minutes",
+    )
+
+    parser.add_argument(
+        "--bucket",
+        type=int,
+        default=60,
+        help="Flow aggregation interval in seconds",
+    )
+
+    args = parser.parse_args()
+
+    if args.window < 1 or args.bucket < 1:
+        parser.error("Window and bucket must be positive.")
+
+    aggregate(args.window, args.bucket)
+    print_top_flows()
+    print_device_traffic()
+
+
+if __name__ == "__main__":
+    main()

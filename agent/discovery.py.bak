@@ -1,0 +1,328 @@
+import argparse
+import json
+import ipaddress
+import re
+import subprocess
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+
+from scapy.all import ARP, Ether, srp
+
+from agent.database import (
+    initialize,
+    start_scan,
+    finish_scan,
+    record_device,
+    get_devices,
+    utc_now,
+)
+from agent.interfaces import get_interface_network
+
+
+OUI_FILES = [
+    Path("/usr/share/ieee-data/oui.txt"),
+    Path("/usr/share/ieee-data/oui36.txt"),
+    Path("/usr/share/misc/oui.txt"),
+]
+
+
+def classify_mac(mac):
+    try:
+        first_octet = int(mac.split(":")[0], 16)
+    except (ValueError, IndexError):
+        return "invalid"
+
+    if first_octet & 1:
+        return "multicast"
+
+    if first_octet & 2:
+        return "locally_administered"
+
+    return "globally_administered"
+
+
+@lru_cache(maxsize=1)
+def load_oui_database():
+    vendors = {}
+
+    pattern = re.compile(
+        r"^\s*([0-9A-F]{2}(?:[-:][0-9A-F]{2}){2})"
+        r"\s+\(hex\)\s+(.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    for file_path in OUI_FILES:
+        if not file_path.exists():
+            continue
+
+        try:
+            with file_path.open(
+                "r", encoding="utf-8", errors="replace"
+            ) as file:
+                for line in file:
+                    match = pattern.match(line)
+
+                    if match:
+                        prefix = re.sub(
+                            r"[:-]", "", match.group(1)
+                        ).upper()
+
+                        vendors[prefix] = match.group(2).strip()
+
+        except OSError:
+            continue
+
+    return vendors
+
+
+
+OVERRIDE_FILE = (
+    Path(__file__).resolve().parent.parent
+    / "config"
+    / "oui_overrides.json"
+)
+
+
+@lru_cache(maxsize=1)
+def load_oui_overrides():
+    if not OVERRIDE_FILE.exists():
+        return {}
+
+    with OVERRIDE_FILE.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def lookup_vendor_info(mac):
+    if classify_mac(mac) != "globally_administered":
+        return None, None
+
+    prefix = mac.replace(":", "").replace("-", "").upper()[:6]
+
+    override = load_oui_overrides().get(prefix)
+
+    if override:
+        return override["vendor"], override.get(
+            "source", "local_override"
+        )
+
+    vendor = load_oui_database().get(prefix)
+
+    return vendor, "ieee_oui" if vendor else None
+
+
+def lookup_vendor(mac):
+    return lookup_vendor_info(mac)[0]
+
+
+def lookup_vendor_source(mac):
+    return lookup_vendor_info(mac)[1]
+
+
+
+def lookup_hostname(ip_address, timeout=1.0):
+    try:
+        result = subprocess.run(
+            ["getent", "hosts", ip_address],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        parts = result.stdout.strip().split()
+
+        if len(parts) >= 2:
+            hostname = parts[1].strip()
+
+            if hostname and hostname != ip_address:
+                return hostname
+
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    return None
+
+
+def discover_devices(interface, timeout, offline_after):
+    network_info = get_interface_network(interface)
+
+    network = ipaddress.ip_network(
+        network_info["network"],
+        strict=False,
+    )
+
+    if network.num_addresses > 1024:
+        raise ValueError(
+            f"Network {network} is too large for automatic discovery."
+        )
+
+    started_at = utc_now()
+    scan_id = start_scan(
+        interface,
+        str(network),
+        started_at,
+    )
+
+    print(f"[NETWATCH] Scan ID  : {scan_id}")
+    print(f"[NETWATCH] Interface: {interface}")
+    print(f"[NETWATCH] Local IP : {network_info['ip']}")
+    print(f"[NETWATCH] Subnet   : {network}")
+    print("[NETWATCH] Sending ARP discovery requests...")
+
+    packet = (
+        Ether(dst="ff:ff:ff:ff:ff:ff")
+        / ARP(pdst=str(network))
+    )
+
+    try:
+        answered, _ = srp(
+            packet,
+            iface=interface,
+            timeout=timeout,
+            retry=1,
+            verbose=False,
+        )
+
+        discovered = {}
+
+        for _, response in answered:
+            ip_address = str(response.psrc)
+            mac = str(response.hwsrc).lower()
+
+            try:
+                ipaddress.ip_address(ip_address)
+            except ValueError:
+                continue
+
+            mac_type = classify_mac(mac)
+
+            if mac_type in {"invalid", "multicast"}:
+                continue
+
+            discovered[mac] = ip_address
+
+        timestamp = utc_now()
+
+        vendor_db = load_oui_database()
+
+        for mac, ip_address in discovered.items():
+            mac_type = classify_mac(mac)
+
+            vendor = lookup_vendor(mac)
+            hostname = lookup_hostname(ip_address)
+
+            record_device(
+                mac=mac,
+                ip_address=ip_address,
+                observed_at=timestamp,
+                interface=interface,
+                source="arp",
+                hostname=hostname,
+                vendor=vendor,
+                mac_type=mac_type,
+                scan_id=scan_id,
+                hostname_source="reverse_dns" if hostname else None,
+                vendor_source=lookup_vendor_source(mac),
+            )
+
+        finish_scan(
+            scan_id=scan_id,
+            interface=interface,
+            discovered_count=len(discovered),
+            offline_after_seconds=offline_after,
+        )
+
+        return discovered, scan_id
+
+    except Exception:
+        with __import__("contextlib").suppress(Exception):
+            from agent.database import connect
+
+            with connect() as db:
+                db.execute("""
+                    UPDATE scan_runs
+                    SET completed_at = ?,
+                        status = 'failed'
+                    WHERE id = ?
+                """, (utc_now(), scan_id))
+
+        raise
+
+
+def print_inventory():
+    devices = get_devices()
+
+    print("\n===== NETWATCH DEVICE INTELLIGENCE =====")
+
+    if not devices:
+        print("No devices recorded.")
+        return
+
+    for device in devices:
+        print("\n----------------------------------------")
+        print(f"IP Address       : {device['last_ip']}")
+        print(f"MAC Address      : {device['mac']}")
+        print(f"Hostname         : {device['hostname'] or 'Unknown'}")
+        print(f"Manufacturer     : {device['vendor'] or 'Unknown'}")
+        print(f"MAC Classification: {device['mac_type']}")
+        print(f"Status           : {device['status']}")
+        print(f"Trust            : {device['trust_status']}")
+        print(f"First Seen       : {device['first_seen']}")
+        print(f"Last Seen        : {device['last_seen']}")
+        print(f"Interface        : {device['last_interface']}")
+
+    print("\n----------------------------------------")
+    print(f"Total known devices: {len(devices)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NetWatch Device Intelligence Discovery"
+    )
+
+    parser.add_argument(
+        "--interface",
+        default="wlan0",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=3.0,
+    )
+
+    parser.add_argument(
+        "--offline-after",
+        type=int,
+        default=300,
+        help="Seconds after last observation before a device is offline.",
+    )
+
+    args = parser.parse_args()
+
+    if args.timeout <= 0 or args.offline_after <= 0:
+        parser.error("Timeout and offline threshold must be positive.")
+
+    try:
+        discovered, scan_id = discover_devices(
+            args.interface,
+            args.timeout,
+            args.offline_after,
+        )
+
+        print(f"\n[NETWATCH] Scan completed: {scan_id}")
+        print(f"[NETWATCH] Devices discovered: {len(discovered)}")
+
+        print_inventory()
+
+    except Exception as error:
+        print(f"[ERROR] Discovery failed: {error}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

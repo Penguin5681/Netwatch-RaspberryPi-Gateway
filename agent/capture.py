@@ -1,0 +1,265 @@
+import argparse
+import json
+import socket
+from datetime import datetime, timezone
+from pathlib import Path
+from scapy.layers.igmp import IGMP
+
+
+from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP, Ether
+from scapy.layers.igmp import IGMP
+
+
+
+from agent.database import initialize, connect
+
+ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_FILE = ROOT / "data" / "traffic.jsonl"
+
+BATCH_SIZE = 100
+
+
+def utc_timestamp(packet):
+    timestamp = float(packet.time)
+
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def extract_metadata(packet, interface):
+    if not packet.haslayer(IP) and not packet.haslayer(IPv6):
+        return None
+
+    event = {
+        "event_type": "packet_metadata",
+        "timestamp": utc_timestamp(packet),
+        "capture_node": socket.gethostname(),
+        "interface": interface,
+        "src_mac": None,
+        "dst_mac": None,
+        "src_ip": None,
+        "dst_ip": None,
+        "protocol": "UNKNOWN",
+        "src_port": None,
+        "dst_port": None,
+        "packet_length": len(packet),
+        "tcp_flags": None,
+    }
+
+    if packet.haslayer(Ether):
+        event["src_mac"] = packet[Ether].src
+        event["dst_mac"] = packet[Ether].dst
+
+    if packet.haslayer(IP):
+        ip = packet[IP]
+        event["src_ip"] = ip.src
+        event["dst_ip"] = ip.dst
+
+        if packet.haslayer(TCP):
+            event["protocol"] = "TCP"
+            event["src_port"] = int(packet[TCP].sport)
+            event["dst_port"] = int(packet[TCP].dport)
+            event["tcp_flags"] = str(packet[TCP].flags)
+
+        elif packet.haslayer(UDP):
+            event["protocol"] = "UDP"
+            event["src_port"] = int(packet[UDP].sport)
+            event["dst_port"] = int(packet[UDP].dport)
+
+        elif packet.haslayer(ICMP):
+            event["protocol"] = "ICMP"
+
+        elif packet.haslayer(IGMP):
+            event["protocol"] = "IGMP"
+
+        else:
+            event["protocol"] = f"IP-PROTO-{int(ip.proto)}"
+
+    elif packet.haslayer(IPv6):
+        ip = packet[IPv6]
+        event["src_ip"] = ip.src
+        event["dst_ip"] = ip.dst
+
+        if packet.haslayer(TCP):
+            event["protocol"] = "TCP"
+            event["src_port"] = int(packet[TCP].sport)
+            event["dst_port"] = int(packet[TCP].dport)
+            event["tcp_flags"] = str(packet[TCP].flags)
+
+        elif packet.haslayer(UDP):
+            event["protocol"] = "UDP"
+            event["src_port"] = int(packet[UDP].sport)
+            event["dst_port"] = int(packet[UDP].dport)
+
+        elif any(layer.__name__.startswith("ICMPv6") for layer in packet.layers()):
+            event["protocol"] = "ICMPV6"
+
+        else:
+            extension_names = {
+                0: "IPV6-HOP-BY-HOP",
+                43: "IPV6-ROUTING",
+                44: "IPV6-FRAGMENT",
+                50: "IPV6-ESP",
+                51: "IPV6-AH",
+                60: "IPV6-DESTINATION-OPTIONS",
+                135: "IPV6-MOBILITY",
+            }
+
+            next_header = int(ip.nh)
+
+            event["protocol"] = extension_names.get(
+                next_header,
+                f"IPV6-NH-{next_header}"
+            )
+
+    return event
+
+
+def persist_batch(db, events):
+    if not events:
+        return
+
+    rows = [
+        (
+            event["timestamp"],
+            event["interface"],
+            event["src_mac"],
+            event["dst_mac"],
+            event["src_ip"],
+            event["dst_ip"],
+            event["protocol"],
+            event["src_port"],
+            event["dst_port"],
+            event["packet_length"],
+            event["tcp_flags"],
+        )
+        for event in events
+    ]
+
+    db.executemany("""
+        INSERT INTO packet_observations (
+            timestamp,
+            interface,
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            packet_length,
+            tcp_flags
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+
+    db.commit()
+    events.clear()
+
+
+def capture(interface, duration, bpf_filter):
+    initialize()
+
+    db = connect()
+    pending = []
+    captured = 0
+
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    print("[NETWATCH] Packet capture starting")
+    print(f"[NETWATCH] Interface : {interface}")
+    print(f"[NETWATCH] Duration  : {duration}s")
+    print(f"[NETWATCH] BPF filter: {bpf_filter}")
+    print(f"[NETWATCH] JSONL     : {OUTPUT_FILE}")
+
+    def process_packet(packet):
+        nonlocal captured
+
+        event = extract_metadata(packet, interface)
+
+        if event is None:
+            return
+
+        json_file.write(json.dumps(event) + "\n")
+
+        pending.append(event.copy())
+        captured += 1
+
+        if len(pending) >= BATCH_SIZE:
+            persist_batch(db, pending)
+
+        if captured % 100 == 0:
+            print(f"[NETWATCH] Captured {captured} packets")
+
+    try:
+        with OUTPUT_FILE.open("a", encoding="utf-8") as json_file:
+            sniff(
+                iface=interface,
+                filter=bpf_filter,
+                prn=process_packet,
+                store=False,
+                timeout=duration,
+            )
+
+        persist_batch(db, pending)
+
+    finally:
+        if pending:
+            persist_batch(db, pending)
+
+        db.close()
+
+    print("\n===== CAPTURE SUMMARY =====")
+    print(f"Packets captured: {captured}")
+    print(f"Database: {ROOT / 'data' / 'netwatch.db'}")
+    print(f"JSONL: {OUTPUT_FILE}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NetWatch packet metadata collector"
+    )
+
+    parser.add_argument(
+        "--interface",
+        default="wlan0",
+    )
+
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=60,
+    )
+
+    parser.add_argument(
+        "--filter",
+        default="ip or ip6",
+        help="BPF capture filter",
+    )
+
+    args = parser.parse_args()
+
+    if args.duration < 1:
+        parser.error("Duration must be at least one second.")
+
+    try:
+        capture(
+            interface=args.interface,
+            duration=args.duration,
+            bpf_filter=args.filter,
+        )
+
+    except PermissionError:
+        print("[ERROR] Packet capture requires root privileges.")
+        raise SystemExit(1)
+
+    except Exception as error:
+        print(f"[ERROR] Capture failed: {error}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
