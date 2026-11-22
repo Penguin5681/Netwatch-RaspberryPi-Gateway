@@ -1,0 +1,382 @@
+import argparse
+import time
+import traceback
+
+from datetime import datetime, timedelta, timezone
+
+from agent.database import connect
+from agent.capture import capture
+from agent.flow_engine import aggregate
+
+from agent.discovery import discover_devices
+from agent.baseline_engine import run_baseline
+from agent.threat_detection import run_detection
+from agent.risk_engine import assess_risks
+from agent.incident_engine import correlate
+
+
+def run_stage(name, function, *args, **kwargs):
+    """Run an engine independently and report failures without crashing the monitor."""
+    print(f"\n[NETWATCH] Starting: {name}", flush=True)
+
+    started = time.monotonic()
+
+    try:
+        function(*args, **kwargs)
+        elapsed = time.monotonic() - started
+
+        print(
+            f"[NETWATCH] Completed: {name} ({elapsed:.2f}s)",
+            flush=True,
+        )
+        return True
+
+    except Exception as error:
+        elapsed = time.monotonic() - started
+
+        print(
+            f"[NETWATCH] FAILED: {name} after {elapsed:.2f}s: {error}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return False
+
+
+def latest_completed_metrics_window(interface, bucket_seconds):
+    """
+    Return the latest fully completed metrics bucket.
+
+    This prevents baseline evaluation from processing an incomplete
+    window or repeatedly evaluating the same window.
+    """
+    db = connect()
+
+    try:
+        rows = db.execute("""
+            SELECT DISTINCT window_start
+            FROM device_window_metrics
+            WHERE interface = ?
+            ORDER BY window_start DESC
+            LIMIT 120
+        """, (interface,)).fetchall()
+    finally:
+        db.close()
+
+    now = datetime.now(timezone.utc)
+
+    for row in rows:
+        window_start = datetime.fromisoformat(
+            row["window_start"].replace("Z", "+00:00")
+        )
+
+        if window_start.tzinfo is None:
+            window_start = window_start.replace(
+                tzinfo=timezone.utc
+            )
+
+        if (
+            window_start + timedelta(seconds=bucket_seconds)
+            <= now
+        ):
+            return row["window_start"]
+
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NetWatch continuous network intelligence pipeline"
+    )
+
+    # Capture and aggregation.
+    parser.add_argument("--interface", default="wlan1")
+    parser.add_argument("--duration", type=int, default=55)
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--window", type=int, default=15)
+    parser.add_argument("--bucket", type=int, default=60)
+    parser.add_argument("--filter", default="ip or ip6")
+
+    # Device discovery.
+    parser.add_argument(
+        "--discovery-interval",
+        type=int,
+        default=300,
+    )
+    parser.add_argument(
+        "--discovery-timeout",
+        type=float,
+        default=3.0,
+    )
+    parser.add_argument(
+        "--offline-after",
+        type=int,
+        default=900,
+    )
+
+    # Behavioural baseline.
+    parser.add_argument(
+        "--minimum-baseline-samples",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "--baseline-history",
+        type=int,
+        default=30,
+    )
+
+    # Threat detection.
+    parser.add_argument(
+        "--threat-lookback-minutes",
+        type=int,
+        default=5,
+    )
+
+    # Risk assessment.
+    parser.add_argument(
+        "--risk-interval",
+        type=int,
+        default=300,
+    )
+    parser.add_argument(
+        "--risk-lookback-hours",
+        type=int,
+        default=24,
+    )
+
+    # Incident correlation.
+    parser.add_argument(
+        "--incident-lookback-hours",
+        type=int,
+        default=24,
+    )
+    parser.add_argument(
+        "--incident-gap-minutes",
+        type=int,
+        default=10,
+    )
+
+    args = parser.parse_args()
+
+    positive_values = {
+        "duration": args.duration,
+        "interval": args.interval,
+        "window": args.window,
+        "bucket": args.bucket,
+        "discovery_interval": args.discovery_interval,
+        "discovery_timeout": args.discovery_timeout,
+        "offline_after": args.offline_after,
+        "minimum_baseline_samples": args.minimum_baseline_samples,
+        "baseline_history": args.baseline_history,
+        "threat_lookback_minutes": args.threat_lookback_minutes,
+        "risk_interval": args.risk_interval,
+        "risk_lookback_hours": args.risk_lookback_hours,
+        "incident_lookback_hours": args.incident_lookback_hours,
+        "incident_gap_minutes": args.incident_gap_minutes,
+    }
+
+    invalid = [
+        name for name, value in positive_values.items()
+        if value <= 0
+    ]
+
+    if invalid:
+        parser.error(
+            "All configured values must be positive: "
+            + ", ".join(invalid)
+        )
+
+    if args.offline_after < args.discovery_interval * 2:
+        parser.error(
+            "--offline-after should be at least twice "
+            "--discovery-interval."
+        )
+
+    print("==============================================")
+    print(" NETWATCH CONTINUOUS INTELLIGENCE PIPELINE")
+    print("==============================================")
+    print(f"Capture interface       : {args.interface}")
+    print(f"Capture duration        : {args.duration}s")
+    print(f"Cycle interval          : {args.interval}s")
+    print(f"Analysis window         : {args.window} minutes")
+    print(f"Aggregation bucket      : {args.bucket}s")
+    print(f"Discovery interval      : {args.discovery_interval}s")
+    print(f"Discovery timeout       : {args.discovery_timeout}s")
+    print(f"Device offline threshold: {args.offline_after}s")
+    print(f"Baseline minimum samples: {args.minimum_baseline_samples}")
+    print(f"Baseline history        : {args.baseline_history}")
+    print(f"Threat lookback         : {args.threat_lookback_minutes} minutes")
+    print(f"Risk assessment interval: {args.risk_interval}s")
+    print(f"Risk lookback           : {args.risk_lookback_hours} hours")
+    print(f"Incident lookback       : {args.incident_lookback_hours} hours")
+    print(f"Incident correlation gap: {args.incident_gap_minutes} minutes")
+    print("Press Ctrl+C to stop.")
+    print("==============================================")
+
+    cycle = 0
+
+    # Monotonic clocks are used for scheduling.
+    last_discovery = 0.0
+    last_risk_assessment = 0.0
+
+    # Only evaluate each completed baseline window once per process.
+    last_baseline_window = None
+
+    try:
+        while True:
+            cycle += 1
+            cycle_started = time.monotonic()
+            failures = []
+
+            print(
+                f"\n\n========== MONITOR CYCLE {cycle} ==========",
+                flush=True,
+            )
+
+            # 1. Discovery runs before detection so device inventory
+            #    is current when unknown-device rules execute.
+            now = time.monotonic()
+
+            if now - last_discovery >= args.discovery_interval:
+                success = run_stage(
+                    "Device discovery",
+                    discover_devices,
+                    args.interface,
+                    args.discovery_timeout,
+                    args.offline_after,
+                )
+
+                if success:
+                    last_discovery = time.monotonic()
+                else:
+                    failures.append("device_discovery")
+
+            # 2. Capture packet metadata.
+            if not run_stage(
+                "Packet capture",
+                capture,
+                args.interface,
+                args.duration,
+                args.filter,
+            ):
+                failures.append("packet_capture")
+
+            # 3. Aggregate packets into flows and device metrics.
+            if not run_stage(
+                "Flow aggregation",
+                aggregate,
+                window_minutes=args.window,
+                bucket_seconds=args.bucket,
+                interface=args.interface,
+            ):
+                failures.append("flow_aggregation")
+
+            # 4. Evaluate only a newly completed time bucket.
+            try:
+                completed_window = latest_completed_metrics_window(
+                    args.interface,
+                    args.bucket,
+                )
+            except Exception:
+                completed_window = None
+                failures.append("baseline_window_lookup")
+                print(
+                    "[NETWATCH] Could not inspect completed baseline windows.",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+            if (
+                completed_window is not None
+                and completed_window != last_baseline_window
+            ):
+                success = run_stage(
+                    "Behavioural baseline evaluation",
+                    run_baseline,
+                    interface=args.interface,
+                    minimum_samples=args.minimum_baseline_samples,
+                    history_limit=args.baseline_history,
+                    bucket_seconds=args.bucket,
+                )
+
+                if success:
+                    last_baseline_window = completed_window
+                else:
+                    failures.append("baseline_evaluation")
+
+            else:
+                print(
+                    "[NETWATCH] Baseline evaluation skipped: "
+                    "no new completed metrics window.",
+                    flush=True,
+                )
+
+            # 5. Threat detection imports baseline anomalies and
+            #    examines recent packet observations.
+            if not run_stage(
+                "Threat detection",
+                run_detection,
+                interface=args.interface,
+                lookback_minutes=args.threat_lookback_minutes,
+                bucket_seconds=args.bucket,
+            ):
+                failures.append("threat_detection")
+
+            # 6. Risk assessments run less frequently because every
+            #    assessment creates a history record per device.
+            now = time.monotonic()
+
+            if now - last_risk_assessment >= args.risk_interval:
+                success = run_stage(
+                    "Risk assessment",
+                    assess_risks,
+                    lookback_hours=args.risk_lookback_hours,
+                )
+
+                if success:
+                    last_risk_assessment = time.monotonic()
+                else:
+                    failures.append("risk_assessment")
+
+            else:
+                print(
+                    "[NETWATCH] Risk assessment skipped: "
+                    "next scheduled interval has not elapsed.",
+                    flush=True,
+                )
+
+            # 7. Correlate active unlinked security events after risk
+            #    scores have been refreshed.
+            if not run_stage(
+                "Incident correlation",
+                correlate,
+                lookback_hours=args.incident_lookback_hours,
+                gap_minutes=args.incident_gap_minutes,
+            ):
+                failures.append("incident_correlation")
+
+            elapsed = time.monotonic() - cycle_started
+            sleep_time = max(0, args.interval - elapsed)
+
+            print("\n========== CYCLE SUMMARY ==========")
+            print(f"Cycle                  : {cycle}")
+            print(f"Execution time         : {elapsed:.2f}s")
+            print(f"Scheduled sleep        : {sleep_time:.2f}s")
+            print(f"Failed stages          : {len(failures)}")
+
+            if failures:
+                print("Failures               : " + ", ".join(failures))
+            else:
+                print("Pipeline status        : ALL STAGES HEALTHY")
+
+            print("===================================")
+
+            if sleep_time:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print("\n[NETWATCH] Monitoring stopped cleanly.")
+
+
+if __name__ == "__main__":
+    main()

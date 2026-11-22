@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import ipaddress
 import os
 import secrets
 from contextlib import asynccontextmanager, contextmanager
@@ -26,6 +27,15 @@ from agent.baseline_engine import ensure_schema as ensure_baseline_schema
 from agent.threat_detection import ensure_schema as ensure_threat_schema
 from agent.risk_engine import ensure_schema as ensure_risk_schema
 from agent.incident_engine import ensure_schema as ensure_incident_schema
+from agent.device_classifier import ensure_schema as ensure_classifier_schema
+from agent.communication_intelligence import (
+    get_network as get_communication_network,
+    make_cutoff as communication_cutoff,
+    get_flow_cursor as communication_flow_cursor,
+    get_device_flows as communication_device_flows,
+    aggregate_device_communication,
+    is_local as communication_is_local,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -681,6 +691,166 @@ def get_device(device_ip: str):
 # TRAFFIC INTELLIGENCE
 # ---------------------------------------------------------
 
+
+@app.get(
+    "/api/v1/device-classifications",
+    tags=["Device Intelligence"],
+)
+def list_device_classifications(
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    category: str | None = Query(None, min_length=1, max_length=64),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    conditions = ["interface = ?"]
+    params = [interface]
+
+    if category is not None:
+        conditions.append("category = ?")
+        params.append(category)
+
+    where_clause = " AND ".join(conditions)
+
+    with db_session() as db:
+        ensure_classifier_schema(db)
+
+        total = db.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM device_classifications
+            WHERE {where_clause}
+            """,
+            params,
+        ).fetchone()[0]
+
+        rows = db.execute(
+            f"""
+            SELECT *
+            FROM device_classifications
+            WHERE {where_clause}
+            ORDER BY confidence DESC, device_ip
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+
+    results = []
+    for row in rows:
+        item = dict(row)
+        for field in (
+            "evidence_json",
+            "candidates_json",
+            "flow_context_json",
+        ):
+            decode_json_field(item, field)
+        results.append(item)
+
+    return {
+        **page_metadata(rows, total, limit, offset),
+        "interface": interface,
+        "category_filter": category,
+        "classifications": results,
+    }
+
+
+@app.get(
+    "/api/v1/device-classifications/{device_ip}/history",
+    tags=["Device Intelligence"],
+)
+def get_device_classification_history(
+    device_ip: str,
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    with db_session() as db:
+        ensure_classifier_schema(db)
+
+        total = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM device_classification_history
+            WHERE interface = ? AND device_ip = ?
+            """,
+            (interface, device_ip),
+        ).fetchone()[0]
+
+        rows = db.execute(
+            """
+            SELECT *
+            FROM device_classification_history
+            WHERE interface = ? AND device_ip = ?
+            ORDER BY classified_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (interface, device_ip, limit, offset),
+        ).fetchall()
+
+    if total == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Device classification history not found.",
+        )
+
+    results = []
+    for row in rows:
+        item = dict(row)
+        decode_json_field(item, "evidence_json")
+        results.append(item)
+
+    return {
+        **page_metadata(rows, total, limit, offset),
+        "device_ip": device_ip,
+        "interface": interface,
+        "history": results,
+    }
+
+
+@app.get(
+    "/api/v1/device-classifications/{device_ip}",
+    tags=["Device Intelligence"],
+)
+def get_device_classification(
+    device_ip: str,
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+):
+    with db_session() as db:
+        ensure_classifier_schema(db)
+
+        row = db.execute(
+            """
+            SELECT *
+            FROM device_classifications
+            WHERE interface = ? AND device_ip = ?
+            ORDER BY classified_at DESC
+            LIMIT 1
+            """,
+            (interface, device_ip),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Device classification not found.",
+        )
+
+    item = dict(row)
+    for field in (
+        "evidence_json",
+        "candidates_json",
+        "flow_context_json",
+    ):
+        decode_json_field(item, field)
+
+    return {
+        "classification": item,
+        "interpretation": (
+            "Confidence is an evidence score, not a calibrated "
+            "probability that the device belongs to this category."
+        ),
+    }
+
+
 @app.get("/api/v1/traffic/summary", tags=["Traffic"])
 def traffic_summary(
     window_minutes: int = Query(15, ge=1, le=10080),
@@ -824,6 +994,337 @@ def device_traffic(
 # BEHAVIOURAL ANALYSIS
 # ---------------------------------------------------------
 
+
+
+def communication_network(interface):
+    # Use the latest successful discovery record instead of querying
+    # kernel interfaces from the sandboxed API process.
+    with db_session() as db:
+        row = db.execute("""
+            SELECT subnet
+            FROM scan_runs
+            WHERE interface = ?
+              AND status = 'completed'
+              AND subnet IS NOT NULL
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+        """, (interface,)).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No completed discovery scan is available "
+                f"for interface {interface}."
+            ),
+        )
+
+    try:
+        return ipaddress.ip_network(row["subnet"], strict=False)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Stored subnet for {interface} is invalid.",
+        ) from error
+
+
+def validate_communication_device(device_ip, network):
+    try:
+        address = ipaddress.ip_address(device_ip)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid device IP address.",
+        ) from error
+
+    if address.version != network.version or address not in network:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Device IP must belong to monitored subnet {network}.",
+        )
+
+
+def communication_peer_items(profile):
+    items = []
+
+    for (peer_ip, protocol, peer_port), stats in profile["peers"].items():
+        items.append({
+            "peer_ip": peer_ip,
+            "protocol": protocol,
+            "peer_port": peer_port,
+            "flows": stats["flows"],
+            "packets": stats["packets"],
+            "tx_bytes": stats["tx_bytes"],
+            "rx_bytes": stats["rx_bytes"],
+            "total_bytes": stats["tx_bytes"] + stats["rx_bytes"],
+        })
+
+    return sorted(
+        items,
+        key=lambda item: item["total_bytes"],
+        reverse=True,
+    )
+
+
+def build_communication_profile(db, interface, device_ip, since_hours):
+    cutoff = communication_cutoff(since_hours)
+    rows = communication_device_flows(
+        db,
+        interface,
+        device_ip,
+        cutoff,
+    )
+    profile = aggregate_device_communication(rows, device_ip)
+
+    return {
+        "device_ip": device_ip,
+        "interface": interface,
+        "lookback_hours": since_hours,
+        "flows": profile["flows"],
+        "packets": profile["packets"],
+        "unique_peers": len(profile["destinations"]),
+        "tx_bytes": profile["tx_bytes"],
+        "rx_bytes": profile["rx_bytes"],
+        "protocols": dict(profile["protocols"]),
+        "peer_ports": [
+            {"port": port, "flow_records": count}
+            for port, count in profile["ports"].most_common()
+        ],
+        "peers": communication_peer_items(profile),
+    }
+
+
+@app.get(
+    "/api/v1/communication/top",
+    tags=["Communication Intelligence"],
+)
+def communication_top_devices(
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    since_hours: float = Query(24, gt=0, le=720),
+    limit: int = Query(15, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    network = communication_network(interface)
+    cutoff = communication_cutoff(since_hours)
+
+    devices = {}
+
+    with db_session() as db:
+        ensure_flow_schema(db)
+
+        for row in communication_flow_cursor(db, interface, cutoff):
+            a_ip = row["endpoint_a_ip"]
+            b_ip = row["endpoint_b_ip"]
+
+            a_local = communication_is_local(a_ip, network)
+            b_local = communication_is_local(b_ip, network)
+
+            if a_local:
+                item = devices.setdefault(a_ip, {
+                    "device_ip": a_ip,
+                    "flows": 0,
+                    "packets": 0,
+                    "tx_bytes": 0,
+                    "rx_bytes": 0,
+                    "peers": set(),
+                })
+                item["flows"] += 1
+                item["packets"] += row["packets"]
+                item["tx_bytes"] += row["a_to_b_bytes"]
+                item["rx_bytes"] += row["b_to_a_bytes"]
+                item["peers"].add(b_ip)
+
+            if b_local:
+                item = devices.setdefault(b_ip, {
+                    "device_ip": b_ip,
+                    "flows": 0,
+                    "packets": 0,
+                    "tx_bytes": 0,
+                    "rx_bytes": 0,
+                    "peers": set(),
+                })
+                item["flows"] += 1
+                item["packets"] += row["packets"]
+                item["tx_bytes"] += row["b_to_a_bytes"]
+                item["rx_bytes"] += row["a_to_b_bytes"]
+                item["peers"].add(a_ip)
+
+    ordered = sorted(
+        devices.values(),
+        key=lambda item: item["tx_bytes"] + item["rx_bytes"],
+        reverse=True,
+    )
+
+    results = [
+        {
+            **item,
+            "unique_peers": len(item.pop("peers")),
+            "total_bytes": item["tx_bytes"] + item["rx_bytes"],
+        }
+        for item in ordered[offset:offset + limit]
+    ]
+
+    return {
+        **page_metadata(results, len(ordered), limit, offset),
+        "interface": interface,
+        "subnet": str(network),
+        "since_hours": since_hours,
+        "devices": results,
+    }
+
+
+@app.get(
+    "/api/v1/communication/new-destinations",
+    tags=["Communication Intelligence"],
+)
+def communication_new_destinations(
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    since_hours: float = Query(24, gt=0, le=720),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    network = communication_network(interface)
+    cutoff = communication_cutoff(since_hours)
+    destinations = {}
+
+    with db_session() as db:
+        ensure_flow_schema(db)
+
+        # Read all retained records to determine the actual first
+        # observation for each local-device/destination pair.
+        for row in communication_flow_cursor(db, interface):
+            a_ip = row["endpoint_a_ip"]
+            b_ip = row["endpoint_b_ip"]
+
+            a_local = communication_is_local(a_ip, network)
+            b_local = communication_is_local(b_ip, network)
+
+            # Ignore internal-only and external-only conversations.
+            if a_local == b_local:
+                continue
+
+            device_ip = a_ip if a_local else b_ip
+            destination_ip = b_ip if a_local else a_ip
+            key = (device_ip, destination_ip)
+
+            item = destinations.setdefault(key, {
+                "device_ip": device_ip,
+                "destination_ip": destination_ip,
+                "first_seen": row["first_seen"],
+                "protocols": set(),
+                "ports": set(),
+            })
+
+            if row["first_seen"] < item["first_seen"]:
+                item["first_seen"] = row["first_seen"]
+
+            item["protocols"].add(row["protocol"])
+
+            destination_port = (
+                row["endpoint_b_port"]
+                if a_local
+                else row["endpoint_a_port"]
+            )
+
+            if destination_port is not None:
+                item["ports"].add(destination_port)
+
+    recent = []
+    for item in destinations.values():
+        if item["first_seen"] >= cutoff:
+            recent.append({
+                **item,
+                "protocols": sorted(item["protocols"]),
+                "ports": sorted(item["ports"]),
+            })
+
+    recent.sort(
+        key=lambda item: item["first_seen"],
+        reverse=True,
+    )
+
+    results = recent[offset:offset + limit]
+
+    return {
+        **page_metadata(results, len(recent), limit, offset),
+        "interface": interface,
+        "subnet": str(network),
+        "since_hours": since_hours,
+        "definition": (
+            "First observed in retained flow history; "
+            "not a maliciousness verdict."
+        ),
+        "new_destinations": results,
+    }
+
+
+@app.get(
+    "/api/v1/communication/{device_ip}/peers",
+    tags=["Communication Intelligence"],
+)
+def communication_device_peers(
+    device_ip: str,
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    since_hours: float = Query(24, gt=0, le=720),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    network = communication_network(interface)
+    validate_communication_device(device_ip, network)
+
+    with db_session() as db:
+        ensure_flow_schema(db)
+        profile = build_communication_profile(
+            db,
+            interface,
+            device_ip,
+            since_hours,
+        )
+
+    peers = profile.pop("peers")
+    results = peers[offset:offset + limit]
+
+    return {
+        **page_metadata(results, len(peers), limit, offset),
+        **profile,
+        "peers": results,
+    }
+
+
+@app.get(
+    "/api/v1/communication/{device_ip}",
+    tags=["Communication Intelligence"],
+)
+def communication_device_profile(
+    device_ip: str,
+    interface: str = Query("wlan1", min_length=1, max_length=32),
+    since_hours: float = Query(24, gt=0, le=720),
+    peer_limit: int = Query(20, ge=1, le=100),
+):
+    network = communication_network(interface)
+    validate_communication_device(device_ip, network)
+
+    with db_session() as db:
+        ensure_flow_schema(db)
+        profile = build_communication_profile(
+            db,
+            interface,
+            device_ip,
+            since_hours,
+        )
+
+    profile["subnet"] = str(network)
+    profile["peers"] = profile["peers"][:peer_limit]
+
+    return {
+        "profile": profile,
+        "interpretation": (
+            "Traffic observations describe recorded communication. "
+            "They do not establish that a peer or destination is safe."
+        ),
+    }
+
+
 @app.get("/api/v1/anomalies", tags=["Behavioural Analysis"])
 def list_anomalies(
     device_ip: str | None = None,
@@ -935,23 +1436,35 @@ def list_security_events(
 @app.get("/api/v1/risks", tags=["Risk"])
 def list_risks(
     minimum_score: int = Query(0, ge=0, le=100),
+    interface: str | None = Query(None, min_length=1, max_length=32),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    with db_session() as db:
-        total = db.execute("""
-            SELECT COUNT(*)
-            FROM risk_assessments
-            WHERE risk_score >= ?
-        """, (minimum_score,)).fetchone()[0]
+    query = """
+        SELECT *
+        FROM risk_assessments
+        WHERE risk_score >= ?
+    """
+    params = [minimum_score]
 
-        rows = db.execute("""
-            SELECT *
-            FROM risk_assessments
-            WHERE risk_score >= ?
-            ORDER BY risk_score DESC
-            LIMIT ? OFFSET ?
-        """, (minimum_score, limit, offset)).fetchall()
+    if interface is not None:
+        query += " AND interface = ?"
+        params.append(interface)
+
+    count_query = query.replace(
+        "SELECT *",
+        "SELECT COUNT(*)",
+        1,
+    )
+
+    query += " ORDER BY risk_score DESC LIMIT ? OFFSET ?"
+
+    with db_session() as db:
+        total = db.execute(count_query, params).fetchone()[0]
+        rows = db.execute(
+            query,
+            [*params, limit, offset],
+        ).fetchall()
 
     results = [
         decode_json_field(dict(row), "factors_json")
@@ -968,21 +1481,41 @@ def list_risks(
 
 
 @app.get("/api/v1/risks/{device_ip}", tags=["Risk"])
-def get_device_risk(device_ip: str):
+def get_device_risk(
+    device_ip: str,
+    interface: str | None = Query(None, min_length=1, max_length=32),
+):
     with db_session() as db:
-        row = db.execute("""
-            SELECT *
-            FROM risk_assessments
-            WHERE device_ip = ?
-        """, (device_ip,)).fetchone()
+        if interface is None:
+            row = db.execute("""
+                SELECT *
+                FROM risk_assessments
+                WHERE device_ip = ?
+            """, (device_ip,)).fetchone()
 
-        history = db.execute("""
-            SELECT *
-            FROM risk_assessment_history
-            WHERE device_ip = ?
-            ORDER BY assessed_at DESC
-            LIMIT 30
-        """, (device_ip,)).fetchall()
+            history = db.execute("""
+                SELECT *
+                FROM risk_assessment_history
+                WHERE device_ip = ?
+                ORDER BY assessed_at DESC
+                LIMIT 30
+            """, (device_ip,)).fetchall()
+        else:
+            row = db.execute("""
+                SELECT *
+                FROM risk_assessments
+                WHERE device_ip = ?
+                  AND interface = ?
+            """, (device_ip, interface)).fetchone()
+
+            history = db.execute("""
+                SELECT *
+                FROM risk_assessment_history
+                WHERE device_ip = ?
+                  AND interface = ?
+                ORDER BY assessed_at DESC
+                LIMIT 30
+            """, (device_ip, interface)).fetchall()
 
     if row is None:
         raise HTTPException(

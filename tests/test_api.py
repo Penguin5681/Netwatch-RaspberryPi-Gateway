@@ -41,30 +41,32 @@ def test_health(client):
 
 
 def test_empty_collection_endpoints(client):
-    """Every collection endpoint should handle an empty database."""
+    """Collection endpoints handle empty databases; communication requires a scan."""
     cases = [
-        ("/api/v1/devices", "devices"),
-        ("/api/v1/traffic/flows", "flows"),
-        ("/api/v1/anomalies", "anomalies"),
-        ("/api/v1/security/events", "events"),
-        ("/api/v1/risks", "assessments"),
-        ("/api/v1/incidents", "incidents"),
-        ("/api/v1/scans", "scans"),
+        "/api/v1/devices",
+        "/api/v1/device-classifications",
+        "/api/v1/traffic/flows",
+        "/api/v1/anomalies",
+        "/api/v1/security/events",
+        "/api/v1/risks",
+        "/api/v1/incidents",
+        "/api/v1/scans",
     ]
 
-    for path, collection_key in cases:
+    for path in cases:
         response = client.get(path)
-
         assert response.status_code == 200, (
             f"{path} returned {response.status_code}: {response.text}"
         )
-        body = response.json()
-        assert body["count"] == 0
-        assert body["total"] == 0
-        assert body["offset"] == 0
-        assert body["limit"] >= 1
-        assert body[collection_key] == []
 
+    # Communication endpoints need a completed discovery scan.
+    for path in (
+        "/api/v1/communication/top",
+        "/api/v1/communication/new-destinations",
+    ):
+        response = client.get(path)
+        assert response.status_code == 503, response.text
+        assert "completed discovery scan" in response.json()["detail"]
 
 def test_empty_traffic_summary(client):
     response = client.get("/api/v1/traffic/summary")
@@ -90,6 +92,8 @@ def test_empty_device_traffic(client):
 def test_missing_resources_return_404(client):
     cases = [
         "/api/v1/devices/192.0.2.99",
+        "/api/v1/device-classifications/192.0.2.99",
+        "/api/v1/device-classifications/192.0.2.99/history",
         "/api/v1/risks/192.0.2.99",
         "/api/v1/incidents/999999",
     ]
@@ -105,6 +109,9 @@ def test_missing_resources_return_404(client):
     "path",
     [
         "/api/v1/devices?limit=0",
+        "/api/v1/device-classifications?limit=0",
+        "/api/v1/device-classifications?offset=-1",
+        "/api/v1/device-classifications?category=",
         "/api/v1/devices?status=compromised",
         "/api/v1/traffic/summary?window_minutes=0",
         "/api/v1/traffic/flows?limit=1001",
@@ -1028,3 +1035,479 @@ def test_realtime_risk_update_trigger(client):
     assert updated_payload["previous_risk_score"] == 10
     assert updated_payload["risk_score"] == 75
     assert updated_payload["risk_level"] == "critical"
+
+
+def _insert_classification(
+    db,
+    *,
+    interface,
+    device_ip,
+    mac,
+    category,
+    confidence,
+    classified_at,
+):
+    from agent.device_classifier import ensure_schema
+
+    ensure_schema(db)
+
+    evidence = [{
+        "source": "hostname",
+        "signal": "hostname_keyword",
+        "value": "test",
+        "weight": confidence,
+    }]
+    candidates = [{
+        "category": category,
+        "confidence": confidence,
+    }]
+    context = {
+        "flow_count": 10,
+        "unique_peers": 3,
+        "protocols": {"TCP": 8, "UDP": 2},
+    }
+
+    db.execute(
+        """
+        INSERT INTO device_classifications (
+            interface, mac, device_ip, category,
+            candidate_category, confidence, evidence_json,
+            candidates_json, flow_context_json,
+            explanation, classified_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            interface,
+            mac,
+            device_ip,
+            category,
+            category,
+            confidence,
+            json.dumps(evidence),
+            json.dumps(candidates),
+            json.dumps(context),
+            f"Test classification: {category}",
+            classified_at,
+        ),
+    )
+
+    db.execute(
+        """
+        INSERT INTO device_classification_history (
+            interface, mac, device_ip, category,
+            candidate_category, confidence, evidence_json,
+            explanation, classified_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            interface,
+            mac,
+            device_ip,
+            category,
+            category,
+            confidence,
+            json.dumps(evidence),
+            f"Test classification: {category}",
+            classified_at,
+        ),
+    )
+
+
+def test_device_classification_list_filters_interface_and_category(client):
+    db = database.connect()
+
+    try:
+        _insert_classification(
+            db,
+            interface="wlan1",
+            device_ip="10.42.0.57",
+            mac="02:00:00:00:00:01",
+            category="smartphone",
+            confidence=0.78,
+            classified_at="2026-11-22T10:00:00Z",
+        )
+        _insert_classification(
+            db,
+            interface="wlan1",
+            device_ip="10.42.0.58",
+            mac="02:00:00:00:00:02",
+            category="unknown",
+            confidence=0.0,
+            classified_at="2026-11-22T11:00:00Z",
+        )
+        _insert_classification(
+            db,
+            interface="wlan0",
+            device_ip="192.168.31.20",
+            mac="02:00:00:00:00:03",
+            category="computer",
+            confidence=0.80,
+            classified_at="2026-11-22T12:00:00Z",
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/device-classifications",
+        params={"interface": "wlan1", "category": "smartphone"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["interface"] == "wlan1"
+    assert body["classifications"][0]["device_ip"] == "10.42.0.57"
+    assert isinstance(
+        body["classifications"][0]["evidence_json"], list
+    )
+
+    response = client.get(
+        "/api/v1/device-classifications",
+        params={"interface": "wlan1"},
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+
+
+def test_device_classification_detail_decodes_json(client):
+    db = database.connect()
+
+    try:
+        _insert_classification(
+            db,
+            interface="wlan1",
+            device_ip="10.42.0.57",
+            mac="02:00:00:00:00:11",
+            category="smartphone",
+            confidence=0.78,
+            classified_at="2026-11-22T10:00:00Z",
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/device-classifications/10.42.0.57",
+        params={"interface": "wlan1"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    item = body["classification"]
+    assert item["category"] == "smartphone"
+    assert item["confidence"] == 0.78
+    assert isinstance(item["evidence_json"], list)
+    assert isinstance(item["candidates_json"], list)
+    assert isinstance(item["flow_context_json"], dict)
+    assert "not a calibrated probability" in body["interpretation"]
+
+
+def test_device_classification_history_pagination(client):
+    db = database.connect()
+
+    try:
+        _insert_classification(
+            db,
+            interface="wlan1",
+            device_ip="10.42.0.57",
+            mac="02:00:00:00:00:21",
+            category="unknown",
+            confidence=0.0,
+            classified_at="2026-11-22T09:00:00Z",
+        )
+        db.execute(
+            """
+            INSERT INTO device_classification_history (
+                interface, mac, device_ip, category,
+                candidate_category, confidence, evidence_json,
+                explanation, classified_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "wlan1",
+                "02:00:00:00:00:21",
+                "10.42.0.57",
+                "smartphone",
+                "smartphone",
+                0.78,
+                json.dumps([{"source": "hostname", "value": "realme"}]),
+                "Classification updated",
+                "2026-11-22T10:00:00Z",
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/device-classifications/10.42.0.57/history",
+        params={"interface": "wlan1", "limit": 1, "offset": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["count"] == 1
+    assert body["history"][0]["category"] == "smartphone"
+    assert isinstance(body["history"][0]["evidence_json"], list)
+
+
+def test_classification_endpoints_do_not_mix_interfaces(client):
+    db = database.connect()
+
+    try:
+        _insert_classification(
+            db,
+            interface="wlan1",
+            device_ip="10.42.0.57",
+            mac="02:00:00:00:00:31",
+            category="smartphone",
+            confidence=0.78,
+            classified_at="2026-11-22T10:00:00Z",
+        )
+        _insert_classification(
+            db,
+            interface="wlan0",
+            device_ip="192.168.31.57",
+            mac="02:00:00:00:00:32",
+            category="computer",
+            confidence=0.80,
+            classified_at="2026-11-22T10:00:00Z",
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/device-classifications/10.42.0.57",
+        params={"interface": "wlan0"},
+    )
+
+    assert response.status_code == 404
+
+
+
+
+def _insert_communication_flow(
+    db,
+    *,
+    flow_key,
+    window_start,
+    first_seen,
+    interface,
+    endpoint_a_ip,
+    endpoint_a_port,
+    endpoint_b_ip,
+    endpoint_b_port,
+    packets=10,
+    byte_count=5000,
+    a_to_b_packets=6,
+    b_to_a_packets=4,
+    a_to_b_bytes=3000,
+    b_to_a_bytes=2000,
+):
+    from agent.flow_engine import ensure_schema
+
+    ensure_schema(db)
+    db.execute(
+        """
+        INSERT INTO flow_summaries (
+            flow_key, window_start, interface, protocol,
+            endpoint_a_ip, endpoint_a_port,
+            endpoint_b_ip, endpoint_b_port,
+            first_seen, last_seen, packets, bytes,
+            a_to_b_packets, b_to_a_packets,
+            a_to_b_bytes, b_to_a_bytes
+        )
+        VALUES (?, ?, ?, 'TCP', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            flow_key,
+            window_start,
+            interface,
+            endpoint_a_ip,
+            endpoint_a_port,
+            endpoint_b_ip,
+            endpoint_b_port,
+            first_seen,
+            first_seen,
+            packets,
+            byte_count,
+            a_to_b_packets,
+            b_to_a_packets,
+            a_to_b_bytes,
+            b_to_a_bytes,
+        ),
+    )
+
+
+def test_communication_api_empty_collections(client, monkeypatch):
+    import ipaddress
+
+    monkeypatch.setattr(
+        api_main,
+        "communication_network",
+        lambda interface: ipaddress.ip_network("10.42.0.0/24"),
+    )
+
+    for path, key in (
+        ("/api/v1/communication/top", "devices"),
+        (
+            "/api/v1/communication/new-destinations",
+            "new_destinations",
+        ),
+    ):
+        response = client.get(path)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["count"] == 0
+        assert body[key] == []
+
+
+def test_communication_api_profiles_and_destinations(client, monkeypatch):
+    import ipaddress
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        api_main,
+        "communication_network",
+        lambda interface: ipaddress.ip_network("10.42.0.0/24"),
+    )
+
+    now = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+    db = database.connect()
+    try:
+        _insert_communication_flow(
+            db,
+            flow_key="test-communication-flow-1",
+            window_start=now,
+            first_seen=now,
+            interface="wlan1",
+            endpoint_a_ip="10.42.0.57",
+            endpoint_a_port=51000,
+            endpoint_b_ip="203.0.113.10",
+            endpoint_b_port=443,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/communication/10.42.0.57",
+        params={"interface": "wlan1"},
+    )
+    assert response.status_code == 200, response.text
+
+    profile = response.json()["profile"]
+    assert profile["device_ip"] == "10.42.0.57"
+    assert profile["flows"] == 1
+    assert profile["tx_bytes"] == 3000
+    assert profile["rx_bytes"] == 2000
+    assert profile["unique_peers"] == 1
+
+    response = client.get(
+        "/api/v1/communication/10.42.0.57/peers",
+        params={"interface": "wlan1"},
+    )
+    assert response.status_code == 200, response.text
+    peers = response.json()["peers"]
+    assert len(peers) == 1
+    assert peers[0]["peer_ip"] == "203.0.113.10"
+    assert peers[0]["peer_port"] == 443
+
+    response = client.get(
+        "/api/v1/communication/top",
+        params={"interface": "wlan1"},
+    )
+    assert response.status_code == 200, response.text
+    devices = response.json()["devices"]
+    assert devices[0]["device_ip"] == "10.42.0.57"
+    assert devices[0]["total_bytes"] == 5000
+
+    response = client.get(
+        "/api/v1/communication/new-destinations",
+        params={"interface": "wlan1"},
+    )
+    assert response.status_code == 200, response.text
+    new_destinations = response.json()["new_destinations"]
+    assert len(new_destinations) == 1
+    assert new_destinations[0]["destination_ip"] == "203.0.113.10"
+    assert new_destinations[0]["ports"] == [443]
+
+
+def test_communication_api_rejects_out_of_subnet_device(client, monkeypatch):
+    import ipaddress
+
+    monkeypatch.setattr(
+        api_main,
+        "communication_network",
+        lambda interface: ipaddress.ip_network("10.42.0.0/24"),
+    )
+
+    response = client.get(
+        "/api/v1/communication/192.168.31.10",
+        params={"interface": "wlan1"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_communication_api_validates_lookback(client):
+    response = client.get(
+        "/api/v1/communication/top?since_hours=0"
+    )
+    assert response.status_code == 422
+
+
+
+def test_communication_network_uses_latest_completed_scan(client):
+    db = database.connect()
+
+    try:
+        db.execute(
+            """
+            INSERT INTO scan_runs (
+                interface, subnet, started_at, completed_at,
+                discovered_count, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "wlan1",
+                "10.42.0.0/24",
+                "2026-11-22T10:00:00Z",
+                "2026-11-22T10:00:03Z",
+                1,
+                "completed",
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/communication/top?interface=wlan1"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["subnet"] == "10.42.0.0/24"
+
+
+def test_communication_network_requires_completed_scan(client):
+    response = client.get(
+        "/api/v1/communication/top?interface=wlan1"
+    )
+
+    assert response.status_code == 503
+    assert "No completed discovery scan" in response.json()["detail"]
+

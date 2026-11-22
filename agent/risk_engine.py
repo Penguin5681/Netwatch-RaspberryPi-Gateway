@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import json
 
 from collections import defaultdict
@@ -6,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent.database import connect, initialize
+from agent.interfaces import get_interface_network
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +51,7 @@ def ensure_schema(db):
     db.executescript("""
         CREATE TABLE IF NOT EXISTS risk_assessments (
             device_ip TEXT PRIMARY KEY,
+            interface TEXT NOT NULL DEFAULT 'legacy',
             mac TEXT,
             hostname TEXT,
             vendor TEXT,
@@ -63,6 +66,7 @@ def ensure_schema(db):
         CREATE TABLE IF NOT EXISTS risk_assessment_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_ip TEXT NOT NULL,
+            interface TEXT NOT NULL DEFAULT 'legacy',
             mac TEXT,
             hostname TEXT,
             vendor TEXT,
@@ -79,6 +83,40 @@ def ensure_schema(db):
 
         CREATE INDEX IF NOT EXISTS idx_risk_history_time
         ON risk_assessment_history(assessed_at);
+    """)
+
+    # Non-destructive migration for databases created before
+    # interface-aware risk assessments.
+    migrations = {
+        "risk_assessments": {
+            "interface": "TEXT NOT NULL DEFAULT 'legacy'",
+        },
+        "risk_assessment_history": {
+            "interface": "TEXT NOT NULL DEFAULT 'legacy'",
+        },
+    }
+
+    for table, columns in migrations.items():
+        existing = {
+            row["name"]
+            for row in db.execute(f"PRAGMA table_info({table})")
+        }
+
+        for column, definition in columns.items():
+            if column not in existing:
+                db.execute(
+                    f"ALTER TABLE {table} "
+                    f"ADD COLUMN {column} {definition}"
+                )
+
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_risk_assessments_interface
+        ON risk_assessments(interface, risk_score)
+    """)
+
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_risk_history_interface
+        ON risk_assessment_history(interface, device_ip, assessed_at)
     """)
 
 
@@ -158,7 +196,7 @@ def calculate_factors(events, config):
     return min(100, total_score), factors
 
 
-def assess_risks(lookback_hours=24, device_filter=None):
+def assess_risks(lookback_hours=24, device_filter=None, interface='wlan1'):
     if lookback_hours < 1:
         raise ValueError("Lookback period must be positive.")
 
@@ -168,6 +206,18 @@ def assess_risks(lookback_hours=24, device_filter=None):
 
     db = connect()
     ensure_schema(db)
+
+    network_info = get_interface_network(interface)
+    monitored_network = ipaddress.ip_network(
+        network_info["network"],
+        strict=False,
+    )
+
+    def belongs_to_monitored_network(value):
+        try:
+            return ipaddress.ip_address(value) in monitored_network
+        except ValueError:
+            return False
 
     tables = {
         row["name"]
@@ -194,14 +244,18 @@ def assess_risks(lookback_hours=24, device_filter=None):
         SELECT *
         FROM security_events
         WHERE created_at >= ?
+          AND interface = ?
           AND status IN ('open', 'acknowledged')
           AND source_ip IS NOT NULL
         ORDER BY created_at
-    """, (cutoff,)).fetchall()
+    """, (cutoff, interface)).fetchall()
 
     grouped_events = defaultdict(list)
 
     for event in events:
+        if not belongs_to_monitored_network(event["source_ip"]):
+            continue
+
         grouped_events[event["source_ip"]].append(event)
 
     known_devices = {}
@@ -210,7 +264,11 @@ def assess_risks(lookback_hours=24, device_filter=None):
         SELECT last_ip, mac, hostname, vendor
         FROM devices
         WHERE status = 'online'
-    """):
+          AND last_interface = ?
+    """, (interface,)):
+        if not belongs_to_monitored_network(device["last_ip"]):
+            continue
+
         known_devices[device["last_ip"]] = {
             "mac": device["mac"],
             "hostname": device["hostname"],
@@ -230,6 +288,8 @@ def assess_risks(lookback_hours=24, device_filter=None):
     assessed_at = utc_now()
 
     print("\n===== NETWATCH RISK ASSESSMENT =====")
+    print(f"Interface: {interface}")
+    print(f"Monitored subnet: {monitored_network}")
     print(f"Lookback period: {lookback_hours} hours")
     print(f"Devices assessed: {len(device_ips)}")
 
@@ -253,6 +313,7 @@ def assess_risks(lookback_hours=24, device_filter=None):
             db.execute("""
                 INSERT INTO risk_assessments (
                     device_ip,
+                    interface,
                     mac,
                     hostname,
                     vendor,
@@ -263,9 +324,10 @@ def assess_risks(lookback_hours=24, device_filter=None):
                     factors_json,
                     assessed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
                 ON CONFLICT(device_ip) DO UPDATE SET
+                    interface = excluded.interface,
                     mac = excluded.mac,
                     hostname = excluded.hostname,
                     vendor = excluded.vendor,
@@ -277,6 +339,7 @@ def assess_risks(lookback_hours=24, device_filter=None):
                     assessed_at = excluded.assessed_at
             """, (
                 device_ip,
+                interface,
                 identity.get("mac"),
                 identity.get("hostname"),
                 identity.get("vendor"),
@@ -291,6 +354,7 @@ def assess_risks(lookback_hours=24, device_filter=None):
             db.execute("""
                 INSERT INTO risk_assessment_history (
                     device_ip,
+                    interface,
                     mac,
                     hostname,
                     vendor,
@@ -301,9 +365,10 @@ def assess_risks(lookback_hours=24, device_filter=None):
                     factors_json,
                     assessed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 device_ip,
+                interface,
                 identity.get("mac"),
                 identity.get("hostname"),
                 identity.get("vendor"),
@@ -491,6 +556,12 @@ def main():
     )
 
     run_parser.add_argument(
+        "--interface",
+        default="wlan1",
+        help="Interface whose subnet should be assessed.",
+    )
+
+    run_parser.add_argument(
         "--device-ip",
         help="Assess a single device",
     )
@@ -521,6 +592,7 @@ def main():
         assess_risks(
             lookback_hours=args.lookback_hours,
             device_filter=args.device_ip,
+            interface=args.interface,
         )
 
     elif args.command == "list":

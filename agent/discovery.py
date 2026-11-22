@@ -195,6 +195,63 @@ def lookup_vendor_source(mac):
     return lookup_vendor_info(mac)[1]
 
 
+def parse_dhcp_lease_lines(lines, mac, ip_address, now_epoch=None):
+    """Return a matching, non-expired dnsmasq DHCP hostname."""
+    import time
+
+    now_epoch = int(time.time()) if now_epoch is None else now_epoch
+
+    for line in lines:
+        fields = line.strip().split()
+        if len(fields) < 4:
+            continue
+
+        try:
+            expires_at = int(fields[0])
+        except ValueError:
+            continue
+
+        if expires_at != 0 and expires_at <= now_epoch:
+            continue
+
+        if fields[1].lower() != mac.lower() or fields[2] != ip_address:
+            continue
+
+        hostname = fields[3].strip()
+        if hostname in {"", "*", "-", ip_address}:
+            return None
+
+        return hostname
+
+    return None
+
+
+def lookup_dhcp_hostname(mac, ip_address, interface):
+    """Read the NetworkManager dnsmasq lease for this AP interface."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", interface):
+        return None
+
+    lease_file = (
+        Path("/var/lib/NetworkManager")
+        / f"dnsmasq-{interface}.leases"
+    )
+
+    try:
+        with lease_file.open(
+            "r", encoding="utf-8", errors="replace"
+        ) as file:
+            return parse_dhcp_lease_lines(file, mac, ip_address)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        print(
+            f"[NETWATCH] Cannot read DHCP lease file "
+            f"{lease_file}: {error}",
+            flush=True,
+        )
+        return None
+
+
 def lookup_hostname(ip_address, timeout=1.0):
     try:
         result = subprocess.run(
@@ -288,7 +345,22 @@ def discover_devices(interface, timeout, offline_after):
             mac_type = classify_mac(mac)
 
             vendor = lookup_vendor(mac)
-            hostname = lookup_hostname(ip_address)
+
+            dhcp_hostname = lookup_dhcp_hostname(
+                mac, ip_address, interface
+            )
+
+            reverse_dns_hostname = (
+                None if dhcp_hostname else lookup_hostname(ip_address)
+            )
+
+            hostname = dhcp_hostname or reverse_dns_hostname
+
+            hostname_source = (
+                "dhcp_lease" if dhcp_hostname
+                else "reverse_dns" if reverse_dns_hostname
+                else None
+            )
 
             record_device(
                 mac=mac,
@@ -300,7 +372,7 @@ def discover_devices(interface, timeout, offline_after):
                 vendor=vendor,
                 mac_type=mac_type,
                 scan_id=scan_id,
-                hostname_source="reverse_dns" if hostname else None,
+                hostname_source=hostname_source,
                 vendor_source=lookup_vendor_source(mac),
             )
 
