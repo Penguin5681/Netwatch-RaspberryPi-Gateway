@@ -113,7 +113,7 @@ def extract_metadata(packet, interface):
             event["protocol"] = extension_names.get(
                 next_header,
                 f"IPV6-NH-{next_header}"
-            )
+            ) 
 
     return event
 

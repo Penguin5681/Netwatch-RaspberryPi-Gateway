@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "description": "Initial configurable NetWatch investigation-priority weights",
+  "weights": {
+    "tcp_port_scan": 40,
+    "tcp_horizontal_scan": 40,
+    "tcp_connection_burst": 20,
+    "new_unknown_device": 15
+  },
+  "behavioral_severity_weights": {
+    "medium": 10,
+    "high": 20,
+    "critical": 25
+  },
+  "repeat_bonus": 5,
+  "maximum_repeat_bonus": 15,
+  "type_caps": {
+    "tcp_port_scan": 55,
+    "tcp_horizontal_scan": 55,
+    "tcp_connection_burst": 35,
+    "new_unknown_device": 20,
+    "behavioral_deviation": 40
+  },
+  "risk_levels": [
+    {
+      "minimum": 0,
+      "maximum": 0,
+      "label": "Normal"
+    },
+    {
+      "minimum": 1,
+      "maximum": 24,
+      "label": "Low"
+    },
+    {
+      "minimum": 25,
+      "maximum": 49,
+      "label": "Moderate"
+    },
+    {
+      "minimum": 50,
+      "maximum": 74,
+      "label": "High"
+    },
+    {
+      "minimum": 75,
+      "maximum": 100,
+      "label": "Critical"
+    }
+  ]
+}
