@@ -6,3 +6,7 @@ data/*.db-shm
 data/*.db-wal
 logs/*
 .env
+
+.api_token
+
+.ap_passphrase
