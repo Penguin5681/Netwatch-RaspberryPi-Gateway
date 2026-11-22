@@ -105,28 +105,61 @@ def metric_values(row):
         row["protocol_distribution"] or "{}"
     )
 
+    tx_packets = int(row["tx_packets"] or 0)
+    rx_packets = int(row["rx_packets"] or 0)
     tx_bytes = int(row["tx_bytes"] or 0)
     rx_bytes = int(row["rx_bytes"] or 0)
 
+    has_tx = tx_packets > 0
+    has_rx = rx_packets > 0
+    has_traffic = has_tx or has_rx
+
     return {
-        "total_bytes": tx_bytes + rx_bytes,
-        "tx_bytes": tx_bytes,
-        "rx_bytes": rx_bytes,
-        "flow_count": int(row["flow_count"] or 0),
-        "unique_destinations": int(
-            row["unique_destinations"] or 0
+        # These metrics describe either direction.
+        "total_bytes": tx_bytes + rx_bytes if has_traffic else None,
+        "flow_count": int(row["flow_count"] or 0) if has_traffic else None,
+
+        # These metrics require outbound observations.
+        "tx_bytes": tx_bytes if has_tx else None,
+        "unique_destinations": (
+            int(row["unique_destinations"] or 0) if has_tx else None
         ),
-        "unique_destination_ports": int(
-            row["unique_destination_ports"] or 0
+        "unique_destination_ports": (
+            int(row["unique_destination_ports"] or 0) if has_tx else None
         ),
-        "tcp_syn_packets": int(
-            row["tcp_syn_packets"] or 0
+        "tcp_syn_packets": (
+            int(row["tcp_syn_packets"] or 0) if has_tx else None
         ),
-        "tcp_rst_packets": int(
-            row["tcp_rst_packets"] or 0
+        "tcp_rst_packets": (
+            int(row["tcp_rst_packets"] or 0) if has_tx else None
         ),
-        "protocol_count": len(protocols),
+        "protocol_count": len(protocols) if has_tx else None,
+
+        # This metric requires inbound observations.
+        "rx_bytes": rx_bytes if has_rx else None,
     }
+
+
+def select_historical_samples(rows, metric_name, history_limit):
+    """Select the latest active observations for one metric."""
+    if history_limit <= 0:
+        raise ValueError("history_limit must be positive.")
+
+    active = []
+
+    for row in rows:
+        value = metric_values(row)[metric_name]
+
+        if value is not None:
+            active.append((row, value))
+
+    selected = active[-history_limit:]
+
+    sample_rows = [row for row, _ in selected]
+    samples = [value for _, value in selected]
+
+    return sample_rows, samples
+
 
 
 def get_observations(db, interface):
@@ -141,6 +174,8 @@ def get_observations(db, interface):
             m.tcp_syn_packets,
             m.tcp_rst_packets,
             m.protocol_distribution,
+            COALESCE(t.tx_packets, 0) AS tx_packets,
+            COALESCE(t.rx_packets, 0) AS rx_packets,
             COALESCE(t.tx_bytes, 0) AS tx_bytes,
             COALESCE(t.rx_bytes, 0) AS rx_bytes
         FROM device_window_metrics AS m
@@ -432,17 +467,37 @@ def run_baseline(
                 row
                 for row in grouped.get(device_ip, [])
                 if row["window_start"] < latest_window
-            ][-history_limit:]
+            ]
 
             print(f"DEVICE: {device_ip}")
 
             for metric_name, observed in current_values.items():
-                samples = [
-                    metric_values(row)[metric_name]
-                    for row in historical_rows
-                ]
+                sample_rows, samples = select_historical_samples(
+                    historical_rows,
+                    metric_name,
+                    history_limit,
+                )
 
                 sample_count = len(samples)
+
+                if observed is None:
+                    store_status(
+                        db,
+                        interface,
+                        device_ip,
+                        metric_name,
+                        "inactive_window",
+                        sample_count,
+                        latest_window,
+                        now,
+                    )
+
+                    print(
+                        f"  {metric_name:<28} "
+                        f"INACTIVE WINDOW "
+                        f"(active historical samples: {sample_count})"
+                    )
+                    continue
 
                 if sample_count < minimum_samples:
                     store_status(
@@ -471,7 +526,7 @@ def run_baseline(
                     device_ip,
                     metric_name,
                     baseline,
-                    historical_rows,
+                    sample_rows,
                     latest_window,
                     now,
                 )
